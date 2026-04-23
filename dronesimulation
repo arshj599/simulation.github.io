@@ -1,0 +1,399 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Terrain Path Simulations</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #ffffff; font-family: sans-serif; }
+        canvas { display: block; }
+        .ui-panel {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            z-index: 100;
+            background: rgba(255, 255, 255, 0.95);
+            backdrop-filter: blur(8px);
+            border: 1px solid rgba(0, 0, 0, 0.1);
+            color: #1a1a1a;
+            padding: 20px;
+            border-radius: 12px;
+            width: 320px;
+            box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.1);
+            transition: transform 0.4s cubic-bezier(0.4, 0, 0.2, 1), opacity 0.3s;
+        }
+        .ui-panel.collapsed {
+            transform: translateX(-340px);
+            opacity: 0;
+            pointer-events: none;
+        }
+        .mode-btn {
+            width: 100%;
+            padding: 10px;
+            border-radius: 8px;
+            font-weight: 600;
+            font-size: 14px;
+            transition: all 0.2s;
+            border: 1px solid #e2e8f0;
+            margin-bottom: 8px;
+            text-align: left;
+        }
+        .mode-btn.active {
+            background-color: #2563eb;
+            color: white;
+            border-color: #2563eb;
+        }
+        .mode-btn:not(.active):hover {
+            background-color: #f1f5f9;
+        }
+        #toggle-ui {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            z-index: 110;
+            background: #2563eb;
+            color: white;
+            border: none;
+            padding: 8px 12px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-weight: bold;
+            font-size: 12px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }
+    </style>
+</head>
+<body>
+
+    <button id="toggle-ui">Menu</button>
+
+    <div id="main-panel" class="ui-panel">
+        <h1 class="text-xl font-bold mb-1 mt-8">Drone Flight Simulation</h1>
+        <p class="text-sm text-slate-500 mb-4">Navigating complex 3D topography.</p>
+        
+        <button id="btn-mode-1" class="mode-btn active">
+            1. Signal Check Sequence
+        </button>
+        <button id="btn-mode-2" class="mode-btn">
+            2. Airspace Avoidance
+        </button>
+
+        <div id="info-box" class="mt-4 p-3 bg-slate-50 rounded-lg border border-slate-200">
+            <p id="desc-text" class="text-xs text-slate-600 leading-relaxed">
+                <b>Scenario 1:</b> Diagnostics route. The drone pauses twice for 1.5s red flicker checks with a visual alert zone.
+            </p>
+        </div>
+    </div>
+
+    <script>
+        let scene, camera, renderer, terrain, droneGroup, rotors = [], warningZone;
+        let clock = new THREE.Clock();
+        let mode = 1; 
+        let progress = 0;
+        let flickerTimer = 0;
+        let isFlickering = false;
+        let restrictedArea = new THREE.Group();
+        let environmentLayer = new THREE.Group();
+        let pathLine;
+
+        const TERRAIN_SIZE = 100;
+        const TERRAIN_RES = 100; 
+        const FLICKER_DURATION = 1.5;
+
+        function init() {
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0xffffff);
+            scene.fog = new THREE.Fog(0xffffff, 70, 200);
+
+            camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 1000);
+            camera.position.set(90, 80, 90);
+            camera.lookAt(0, 0, 0);
+
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(window.devicePixelRatio);
+            document.body.appendChild(renderer.domElement);
+
+            const ambient = new THREE.AmbientLight(0xffffff, 0.8);
+            scene.add(ambient);
+
+            const sun = new THREE.DirectionalLight(0xffffff, 0.5);
+            sun.position.set(50, 100, 50);
+            scene.add(sun);
+
+            createTerrain();
+            createEnvironment();
+            createDrone();
+
+            scene.add(restrictedArea);
+            scene.add(environmentLayer);
+
+            const pathMat = new THREE.LineBasicMaterial({ color: 0x000000, linewidth: 2 });
+            pathLine = new THREE.Line(new THREE.BufferGeometry(), pathMat);
+            scene.add(pathLine);
+
+            setupControls();
+            
+            document.getElementById('btn-mode-1').onclick = () => setMode(1);
+            document.getElementById('btn-mode-2').onclick = () => setMode(2);
+            document.getElementById('toggle-ui').onclick = () => document.getElementById('main-panel').classList.toggle('collapsed');
+
+            window.addEventListener('resize', onWindowResize);
+            
+            setMode(1);
+            animate();
+        }
+
+        function getHeightAt(x, z) {
+            let h = Math.sin(x * 0.1) * Math.cos(z * 0.1) * 10;
+            h += Math.sin(x * 0.05) * 5;
+            h += Math.cos(z * 0.2) * 2;
+            return h;
+        }
+
+        function createTerrain() {
+            const geo = new THREE.PlaneGeometry(TERRAIN_SIZE, TERRAIN_SIZE, TERRAIN_RES, TERRAIN_RES);
+            geo.rotateX(-Math.PI / 2);
+
+            const pos = geo.attributes.position.array;
+            const colors = [];
+            const color = new THREE.Color();
+
+            for(let i=0; i<pos.length; i+=3) {
+                const h = getHeightAt(pos[i], pos[i+2]);
+                pos[i+1] = h;
+                const t = (h + 12) / 24; 
+                color.setHSL(0.3 * (1 - t), 0.8, 0.5); 
+                colors.push(color.r, color.g, color.b);
+            }
+            geo.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+            geo.computeVertexNormals();
+
+            const mat = new THREE.MeshLambertMaterial({ vertexColors: true, side: THREE.DoubleSide });
+            terrain = new THREE.Mesh(geo, mat);
+            scene.add(terrain);
+
+            const grid = new THREE.GridHelper(TERRAIN_SIZE, 20, 0xcccccc, 0xeeeeee);
+            grid.position.y = -12.1;
+            scene.add(grid);
+        }
+
+        function createEnvironment() {
+            // Army Base at Start
+            const startX = -45, startZ = -45;
+            const startH = getHeightAt(startX, startZ);
+            const baseGroup = new THREE.Group();
+            const buildingMat = new THREE.MeshPhongMaterial({ color: 0x556b2f });
+            for(let i=0; i<3; i++) {
+                const bGeo = new THREE.BoxGeometry(4, 2.5, 3);
+                const building = new THREE.Mesh(bGeo, buildingMat);
+                building.position.set(i*5, 1.25, i*2);
+                baseGroup.add(building);
+            }
+            const fence = new THREE.Mesh(new THREE.BoxGeometry(15, 1, 0.2), new THREE.MeshPhongMaterial({color: 0x888888, transparent: true, opacity: 0.5}));
+            fence.position.set(2, 0.5, 6);
+            baseGroup.add(fence);
+            baseGroup.position.set(startX, startH, startZ);
+            environmentLayer.add(baseGroup);
+
+            // Target X
+            const endX = 45, endZ = 45;
+            const endH = getHeightAt(endX, endZ);
+            const targetGroup = new THREE.Group();
+            const xMat = new THREE.MeshBasicMaterial({ color: 0xff0000 });
+            const arm1 = new THREE.Mesh(new THREE.BoxGeometry(10, 0.2, 2), xMat); arm1.rotation.y = Math.PI/4;
+            const arm2 = new THREE.Mesh(new THREE.BoxGeometry(10, 0.2, 2), xMat); arm2.rotation.y = -Math.PI/4;
+            targetGroup.add(arm1, arm2);
+            targetGroup.position.set(endX, endH + 0.1, endZ);
+            environmentLayer.add(targetGroup);
+
+            // Scenery
+            const towerGeo = new THREE.CylinderGeometry(0.5, 1, 15, 8);
+            const towerMat = new THREE.MeshPhongMaterial({ color: 0x444444 });
+            const supplyGeo = new THREE.BoxGeometry(2, 2, 2);
+            const supplyMat = new THREE.MeshPhongMaterial({ color: 0x8b4513 });
+            const assets = [{ x:-20, z:-30, type:'tower'}, { x:10, z:-40, type:'tower'}, { x:-35, z:10, type:'supply'}, { x:30, z:-10, type:'supply'}, { x:-10, z:25, type:'tower'}, { x:25, z:35, type:'supply'}];
+            assets.forEach(a => {
+                const mesh = new THREE.Mesh(a.type === 'tower' ? towerGeo : supplyGeo, a.type === 'tower' ? towerMat : supplyMat);
+                const h = getHeightAt(a.x, a.z);
+                mesh.position.set(a.x, h + (a.type === 'tower' ? 7.5 : 1), a.z);
+                environmentLayer.add(mesh);
+            });
+        }
+
+        function createDrone() {
+            droneGroup = new THREE.Group();
+            const bodyMat = new THREE.MeshPhongMaterial({ color: 0x333333 });
+            const body = new THREE.Mesh(new THREE.BoxGeometry(2, 0.5, 2), bodyMat);
+            droneGroup.add(body);
+
+            const ledGeo = new THREE.SphereGeometry(0.6, 16, 16);
+            this.droneLED = new THREE.MeshBasicMaterial({ color: 0x00ff00 });
+            const led = new THREE.Mesh(ledGeo, this.droneLED);
+            led.position.y = 0.4;
+            droneGroup.add(led);
+
+            const armGeo = new THREE.BoxGeometry(4, 0.2, 0.2);
+            const arm1 = new THREE.Mesh(armGeo, bodyMat); arm1.rotation.y = Math.PI / 4; droneGroup.add(arm1);
+            const arm2 = new THREE.Mesh(armGeo, bodyMat); arm2.rotation.y = -Math.PI / 4; droneGroup.add(arm2);
+
+            const rotorGeo = new THREE.BoxGeometry(1.5, 0.05, 0.2);
+            const rotorMat = new THREE.MeshBasicMaterial({ color: 0x000000 });
+            [[1.4,0.2,1.4], [-1.4,0.2,1.4], [1.4,0.2,-1.4], [-1.4,0.2,-1.4]].forEach(p => {
+                const rotor = new THREE.Mesh(rotorGeo, rotorMat);
+                rotor.position.set(...p);
+                droneGroup.add(rotor);
+                rotors.push(rotor);
+            });
+
+            // Diagnostic Warning Ellipsoid (Simulation 1)
+            const warningGeo = new THREE.SphereGeometry(1, 24, 24);
+            const warningMat = new THREE.MeshBasicMaterial({ color: 0xff0000, transparent: true, opacity: 0.25, side: THREE.DoubleSide });
+            warningZone = new THREE.Mesh(warningGeo, warningMat);
+            warningZone.scale.set(6, 4, 6); // Ellipsoid shape
+            warningZone.visible = false;
+            droneGroup.add(warningZone);
+
+            scene.add(droneGroup);
+        }
+
+        function setMode(m) {
+            mode = m; progress = 0; flickerTimer = 0; isFlickering = false;
+            const b1 = document.getElementById('btn-mode-1');
+            const b2 = document.getElementById('btn-mode-2');
+            const desc = document.getElementById('desc-text');
+            restrictedArea.clear();
+            warningZone.visible = false;
+
+            if (m === 1) {
+                b1.classList.add('active'); b2.classList.remove('active');
+                desc.innerHTML = "<b>Scenario 1:</b> Diagnostic check with red alert ellipsoid zone appearing during 1.5s pauses.";
+            } else {
+                b2.classList.add('active'); b1.classList.remove('active');
+                desc.innerHTML = "<b>Scenario 2:</b> Avoiding Restricted Airspace. Drone maneuvers around a bold red ellipsoid no-fly zone.";
+                
+                const ellGeo = new THREE.SphereGeometry(1, 32, 32);
+                const ellipsoid = new THREE.Mesh(ellGeo, new THREE.MeshBasicMaterial({ color: 0xff0000, transparent: true, opacity: 0.3 }));
+                ellipsoid.scale.set(10, 15, 10); ellipsoid.position.set(0, 10, 0);
+                restrictedArea.add(ellipsoid);
+                const wire = new THREE.Mesh(ellGeo, new THREE.MeshBasicMaterial({ color: 0xff0000, wireframe: true, transparent: true, opacity: 0.4 }));
+                wire.scale.set(10.05, 15.05, 10.05); wire.position.set(0, 10, 0);
+                restrictedArea.add(wire);
+            }
+            calculatePath();
+        }
+
+        function calculatePath() {
+            const points = [];
+            const start = new THREE.Vector3(-45, 0, -45);
+            const end = new THREE.Vector3(45, 0, 45);
+
+            for (let i = 0; i <= 250; i++) {
+                let t = i / 250;
+                let x = THREE.MathUtils.lerp(start.x, end.x, t);
+                let z = THREE.MathUtils.lerp(start.z, end.z, t);
+
+                if (mode === 2) {
+                    const dist = Math.sqrt(x*x + z*z);
+                    if (dist < 22) {
+                        const angle = Math.atan2(z, x);
+                        const push = (22 - dist) + 12;
+                        x += Math.cos(angle + 1.2) * push;
+                        z += Math.sin(angle + 1.2) * push;
+                    }
+                }
+                points.push(new THREE.Vector3(x, getHeightAt(x, z) + 4, z));
+            }
+            pathLine.geometry.setFromPoints(points);
+            pathLine.userData.points = points;
+            pathLine.userData.checkpoints = [0.3, 0.7];
+            pathLine.userData.reachedCheckpoints = [false, false];
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+            const delta = clock.getDelta();
+            const time = clock.getElapsedTime();
+
+            if (pathLine.userData.points) {
+                const pts = pathLine.userData.points;
+                let speed = 0.18;
+                
+                if (mode === 1) {
+                    const checks = pathLine.userData.checkpoints;
+                    const reached = pathLine.userData.reachedCheckpoints;
+                    for (let i = 0; i < checks.length; i++) {
+                        if (!reached[i] && progress >= checks[i]) {
+                            isFlickering = true;
+                            flickerTimer += delta;
+                            if (flickerTimer >= FLICKER_DURATION) {
+                                reached[i] = true; isFlickering = false; flickerTimer = 0;
+                            }
+                            break;
+                        }
+                    }
+                }
+
+                if (isFlickering) {
+                    speed = 0;
+                    warningZone.visible = true;
+                    // Pulse the warning zone slightly
+                    const scaleFactor = 1 + Math.sin(time * 10) * 0.05;
+                    warningZone.scale.set(6 * scaleFactor, 4 * scaleFactor, 6 * scaleFactor);
+                    
+                    const flash = Math.sin(time * 35) > 0;
+                    this.droneLED.color.setHex(flash ? 0xff0000 : 0x220000);
+                } else {
+                    warningZone.visible = false;
+                    this.droneLED.color.setHex(0x00ff00);
+                    progress += speed * delta;
+                }
+
+                if (progress > 1) {
+                    progress = 0;
+                    pathLine.userData.reachedCheckpoints = [false, false];
+                }
+
+                const index = Math.floor(progress * (pts.length - 1));
+                const pos = pts[index];
+                if (pos) {
+                    droneGroup.position.copy(pos);
+                    const lookTarget = pts[Math.min(index + 1, pts.length - 1)];
+                    if(lookTarget && !isFlickering) droneGroup.lookAt(lookTarget);
+                }
+                rotors.forEach(r => r.rotation.y += 0.5);
+            }
+            renderer.render(scene, camera);
+        }
+
+        function setupControls() {
+            let isDragging = false, prevMouse = { x: 0, y: 0 }, rot = { t: 0.8, p: 1.0 }, dist = 140;
+            const update = () => {
+                camera.position.set(dist * Math.sin(rot.p) * Math.cos(rot.t), dist * Math.cos(rot.p), dist * Math.sin(rot.p) * Math.sin(rot.t));
+                camera.lookAt(0, 0, 0);
+            };
+            window.addEventListener('mousedown', (e) => { if(e.target.tagName === 'CANVAS') { isDragging = true; prevMouse = { x: e.clientX, y: e.clientY }; }});
+            window.addEventListener('mouseup', () => isDragging = false);
+            window.addEventListener('mousemove', (e) => {
+                if (!isDragging) return;
+                rot.t -= (e.clientX - prevMouse.x) * 0.005;
+                rot.p = Math.max(0.1, Math.min(Math.PI/2 - 0.1, rot.p - (e.clientY - prevMouse.y) * 0.005));
+                update();
+                prevMouse = { x: e.clientX, y: e.clientY };
+            });
+            window.addEventListener('wheel', (e) => { dist = Math.max(40, Math.min(300, dist + e.deltaY * 0.1)); update(); });
+            update();
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        window.onload = init;
+    </script>
+</body>
+</html>
